@@ -1,4 +1,6 @@
-.streamlit/secrets.toml
 __pycache__/
 *.pyc
-.faiss_indexes/
+
+# Streamlit local config + secrets
+.streamlit/secrets.toml
+faiss_indexes/
