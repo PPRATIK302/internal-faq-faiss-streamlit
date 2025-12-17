@@ -115,7 +115,6 @@ def _index_dir(file_bytes: bytes) -> Path:
     return INDEX_ROOT / _sha16(file_bytes)
 
 def _has_saved_index(dir_path: Path) -> bool:
-    # LangChain FAISS save_local typically writes index.faiss and index.pkl
     return (dir_path / "index.faiss").exists() and (dir_path / "index.pkl").exists()
 
 @st.cache_resource(show_spinner=False)
@@ -136,7 +135,6 @@ def load_or_build_vectordb(file_bytes: bytes) -> Tuple[FAISS, Dict[str, Any]]:
         vectordb = FAISS.load_local(
             folder_path=str(idx_dir),
             embeddings=embeddings,
-            # Required because FAISS docstore uses pickle. Only load indexes you created/trust.
             allow_dangerous_deserialization=True,
         )
         stats = {}
@@ -393,34 +391,58 @@ def list_sources_markdown(docs: List[Document]) -> str:
 
 def main():
     st.set_page_config(
-        page_title="Internal FAQ RAG – PlaceMakers (FAISS)",
-        layout="wide"
+        page_title="PlaceMakers Under-Construction Regulations & Compliance Assistant",
+        page_icon="🔍",
+        layout="wide",
     )
-    st.title("🔍 Internal FAQ Assistant – PlaceMakers LEARN (FAISS, Auto Corpus)")
+
+    st.title("🔍 PlaceMakers Under-Construction Regulations & Compliance Assistant")
+    st.caption("Internal FAQ Assistant – PlaceMakers LEARN (FAISS, Auto Corpus)")
+
+    # ✅ No "Index Info" section (removed). Sidebar kept empty/clean.
+    st.sidebar.empty()
+
+    # Usage guidelines on the main page
+    with st.expander("📘 Guidelines: How to use this application", expanded=True):
+        st.markdown(
+            """
+**What this app is**
+- **PlaceMakers Under-Construction Regulations & Compliance Assistant** helps you search and summarize answers from the internal **LEARN** corpus.
+- Answers are generated **only** from the indexed articles and include **source links** for verification.
+
+**How to use**
+1. **Type your question** in the input box (use clear keywords like *ground clearance*, *LBP*, *consent*, *moisture*, *PPE*, etc.).
+2. Click **Get Answer**.
+3. Read the **Answer** section (generated only from LEARN content).
+4. Open **Source Articles (Links Only)** to review the exact articles used.
+5. If results are weak, **rephrase** your question (shorter + more specific usually works best).
+
+**Important notes**
+- The corpus is **auto-loaded** from a local TXT file and the FAISS index is cached on disk.
+- If the content is not present in the documents, the assistant will respond:  
+  *“I don't know based on the available documents.”*
+            """
+        )
 
     ensure_openai_key()
 
-    # 🔁 Auto load / build FAISS from local corpus at app start (cached)
+    # Auto load / build FAISS from local corpus at app start (cached)
     with st.spinner("Loading corpus and building/loading FAISS index..."):
-        vectordb, index_info = get_vectordb_from_local_corpus()
-
-    # Sidebar info
-    st.sidebar.header("📂 Index Info")
-    st.sidebar.write(
-        {
-            "mode": index_info.get("mode"),
-            "articles_indexed": index_info.get("articles_indexed", "N/A"),
-            "index_dir": index_info.get("index_dir", "N/A"),
-            "sha16": index_info.get("sha16", "N/A"),
-            "source_file": str(CORPUS_PATH),
-        }
-    )
-    st.sidebar.caption("Corpus is loaded automatically from the local TXT file.")
+        vectordb, _index_info = get_vectordb_from_local_corpus()
 
     st.subheader("Ask a question")
-    question = st.text_input("Ask anything based on the LEARN content:")
+    question = st.text_input(
+        "Ask anything based on the LEARN content:",
+        placeholder="e.g., Why do ground clearances matter for cladding and flooring?",
+    )
 
-    if st.button("Get Answer"):
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        ask = st.button("Get Answer")
+    with col2:
+        st.caption("Tip: Keep questions specific for best results.")
+
+    if ask:
         if not question.strip():
             st.warning("Please type a question.")
             return
@@ -444,7 +466,6 @@ def main():
         st.markdown("### ✅ Answer")
         st.write(answer)
 
-        # 🔗 Only links, not raw chunks
         st.markdown("### 🔗 Source Articles (Links Only)")
         st.caption("These LEARN articles were used to answer your question:")
         st.markdown(list_sources_markdown(docs))
