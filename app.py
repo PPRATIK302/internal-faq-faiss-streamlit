@@ -5,7 +5,13 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Any
 
 import streamlit as st
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# ✅ Compatible import for different LangChain versions
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ModuleNotFoundError:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.documents import Document
@@ -29,11 +35,10 @@ CATEGORIES = [
 INDEX_ROOT = Path("faiss_indexes")  # persisted on disk
 INDEX_ROOT.mkdir(exist_ok=True)
 
-# Local TXT corpus: auto-loaded when app starts
 CORPUS_PATH = Path("placemakers_learn_corpus.txt")
 
 # ============================================================
-# KEY HANDLING (Streamlit Secrets -> env var used by LangChain/OpenAI)
+# KEY HANDLING
 # ============================================================
 
 def ensure_openai_key():
@@ -48,11 +53,6 @@ def ensure_openai_key():
 # ============================================================
 
 def load_and_parse_txt(raw_text: str) -> Tuple[List[str], List[Dict[str, Any]]]:
-    """
-    Read the corpus TXT content and break it into per-article blocks.
-    Each block is separated by a line of '=' characters (80 '=' used by your scraper).
-    Extract TITLE, URL, CATEGORY as metadata; body as article text.
-    """
     blocks = [b.strip() for b in raw_text.split("=" * 80) if b.strip()]
 
     texts: List[str] = []
@@ -69,7 +69,7 @@ def load_and_parse_txt(raw_text: str) -> Tuple[List[str], List[Dict[str, Any]]]:
                 title = ln.split(":", 1)[1].strip()
             elif ln.startswith("URL"):
                 url = ln.split(":", 1)[1].strip()
-                body_start = i + 1  # body after URL line
+                body_start = i + 1
             elif ln.startswith("CATEGORY"):
                 category = ln.split(":", 1)[1].strip()
 
@@ -80,7 +80,6 @@ def load_and_parse_txt(raw_text: str) -> Tuple[List[str], List[Dict[str, Any]]]:
         if not body:
             continue
 
-        # prepend metadata to help embeddings
         full_text = f"Title: {title}\nCategory: {category}\nURL: {url}\n\n{body}"
 
         texts.append(full_text)
@@ -119,10 +118,6 @@ def _has_saved_index(dir_path: Path) -> bool:
 
 @st.cache_resource(show_spinner=False)
 def load_or_build_vectordb(file_bytes: bytes) -> Tuple[FAISS, Dict[str, Any]]:
-    """
-    Cached across Streamlit reruns.
-    Saves FAISS to disk and reloads if already present for the same file content hash.
-    """
     ensure_openai_key()
 
     idx_dir = _index_dir(file_bytes)
@@ -167,11 +162,6 @@ def load_or_build_vectordb(file_bytes: bytes) -> Tuple[FAISS, Dict[str, Any]]:
 
 @st.cache_resource(show_spinner=True)
 def get_vectordb_from_local_corpus() -> Tuple[FAISS, Dict[str, Any]]:
-    """
-    Auto-loads corpus from CORPUS_PATH at app start.
-    - Reads corpus bytes
-    - Builds or loads FAISS index from disk using load_or_build_vectordb
-    """
     if not CORPUS_PATH.exists():
         st.error(f"Corpus file not found: {CORPUS_PATH.resolve()}")
         st.stop()
@@ -274,7 +264,7 @@ def retrieve_docs(
             key = (
                 d.metadata.get("title", ""),
                 d.metadata.get("url", ""),
-                hash(d.page_content[:200]),
+                hash((d.page_content or "")[:200]),
             )
             if key not in seen_ids:
                 seen_ids.add(key)
@@ -290,7 +280,7 @@ def retrieve_docs(
     return all_docs[:max_docs]
 
 # ============================================================
-# STEP 5 – ANSWERING + HALLUCINATION GUARD
+# STEP 5 – ANSWERING
 # ============================================================
 
 def build_context_for_llm(docs: List[Document]) -> str:
@@ -306,6 +296,24 @@ def build_context_for_llm(docs: List[Document]) -> str:
         )
         chunks.append(chunk)
     return "\n\n".join(chunks)
+
+def _is_idk(answer: str) -> bool:
+    a = (answer or "").strip().lower()
+    if not a:
+        return True
+    idk_markers = [
+        "i don't know based on the available documents",
+        "i dont know based on the available documents",
+        "i don't know based on the available document",
+        "i dont know based on the available document",
+        "i don't know based on the context",
+        "i dont know based on the context",
+        "i don't know",
+        "i dont know",
+        "no relevant info",
+        "not enough information",
+    ]
+    return any(m in a for m in idk_markers)
 
 def answer_specific(llm: ChatOpenAI, docs: List[Document], question: str) -> str:
     context = build_context_for_llm(docs)
@@ -365,10 +373,6 @@ def answer_broad(llm: ChatOpenAI, docs: List[Document], question: str) -> str:
 # ============================================================
 
 def list_sources_markdown(docs: List[Document]) -> str:
-    """
-    Return a markdown bullet list of unique (title, url) pairs.
-    This gives you links instead of raw chunks.
-    """
     seen = set()
     lines = []
     for d in docs:
@@ -399,34 +403,24 @@ def main():
     st.title("🔍 PlaceMakers Under-Construction Regulations & Compliance Assistant")
     st.caption("Internal FAQ Assistant – PlaceMakers LEARN (FAISS, Auto Corpus)")
 
-    # ✅ No "Index Info" section (removed). Sidebar kept empty/clean.
     st.sidebar.empty()
 
-    # Usage guidelines on the main page
     with st.expander("📘 Guidelines: How to use this application", expanded=True):
         st.markdown(
             """
 **What this app is**
-- **PlaceMakers Under-Construction Regulations & Compliance Assistant** helps you search and summarize answers from the internal **LEARN** corpus.
-- Answers are generated **only** from the indexed articles and include **source links** for verification.
+- Helps you search and summarize answers from the internal **LEARN** corpus.
+- Answers are generated **only** from the indexed articles.
 
-**How to use**
-1. **Type your question** in the input box (use clear keywords like *ground clearance*, *LBP*, *consent*, *moisture*, *PPE*, etc.).
-2. Click **Get Answer**.
-3. Read the **Answer** section (generated only from LEARN content).
-4. Open **Source Articles (Links Only)** to review the exact articles used.
-5. If results are weak, **rephrase** your question (shorter + more specific usually works best).
-
-**Important notes**
-- The corpus is **auto-loaded** from a local TXT file and the FAISS index is cached on disk.
-- If the content is not present in the documents, the assistant will respond:  
+**Important**
+- If content is not present in documents, assistant responds:  
   *“I don't know based on the available documents.”*
+- ✅ If the answer is *“I don't know…”*, this app will **NOT** show source links.
             """
         )
 
     ensure_openai_key()
 
-    # Auto load / build FAISS from local corpus at app start (cached)
     with st.spinner("Loading corpus and building/loading FAISS index..."):
         vectordb, _index_info = get_vectordb_from_local_corpus()
 
@@ -466,10 +460,11 @@ def main():
         st.markdown("### ✅ Answer")
         st.write(answer)
 
-        st.markdown("### 🔗 Source Articles (Links Only)")
-        st.caption("These LEARN articles were used to answer your question:")
-        st.markdown(list_sources_markdown(docs))
-
+        # ✅ FIX: If answer is "I don't know..." then do NOT show source links
+        if not _is_idk(answer):
+            st.markdown("### 🔗 Source Articles (Links Only)")
+            st.caption("These LEARN articles were used to answer your question:")
+            st.markdown(list_sources_markdown(docs))
 
 if __name__ == "__main__":
     main()
