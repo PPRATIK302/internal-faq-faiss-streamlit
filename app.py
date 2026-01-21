@@ -6,7 +6,7 @@ from typing import List, Tuple, Dict, Any
 
 import streamlit as st
 
-# ✅ Compatible import for different LangChain versions
+# ✅ LangChain splitter import compatibility
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 except ModuleNotFoundError:
@@ -32,7 +32,7 @@ CATEGORIES = [
     "legal",
 ]
 
-INDEX_ROOT = Path("faiss_indexes")  # persisted on disk
+INDEX_ROOT = Path("faiss_indexes")
 INDEX_ROOT.mkdir(exist_ok=True)
 
 CORPUS_PATH = Path("placemakers_learn_corpus.txt")
@@ -81,7 +81,6 @@ def load_and_parse_txt(raw_text: str) -> Tuple[List[str], List[Dict[str, Any]]]:
             continue
 
         full_text = f"Title: {title}\nCategory: {category}\nURL: {url}\n\n{body}"
-
         texts.append(full_text)
         metadatas.append({"title": title, "url": url, "category": category})
 
@@ -179,17 +178,11 @@ def get_llm() -> ChatOpenAI:
 
 def analyze_query(llm: ChatOpenAI, question: str) -> Dict[str, Any]:
     system_msg = (
-        "You are a query analyzer for an internal FAQ assistant based on the "
-        "PlaceMakers 'Under Construction' LEARN articles.\n"
-        "Decide if the user's question is broad (needs many articles and a long answer) "
-        "or specific (can be answered from a few chunks).\n"
-        "Also, select a best-fit category from this list if clear, otherwise 'any': "
-        f"{', '.join(CATEGORIES)}.\n"
-        "If the question mentions safety, hazards, PPE, etc., category is usually 'safety'.\n"
-        "If it mentions regulations, LBP, licensing, consents -> 'lbp_regulation'.\n"
-        "If it mentions business, pricing, invoices, customers -> 'business_tips'.\n"
-        "If not sure, use 'any'.\n"
-        "Also decide if multi-query expansion is helpful (true/false).\n"
+        "You are a query analyzer for an internal FAQ assistant.\n"
+        "Decide if the user's question is broad or specific.\n"
+        "Also select a best-fit category from: "
+        f"{', '.join(CATEGORIES)}. If not sure, use 'any'.\n"
+        "Decide if multi-query expansion is helpful (true/false).\n"
         "Output ONLY valid JSON with keys: intent, category, multi_query."
     )
 
@@ -216,11 +209,9 @@ def analyze_query(llm: ChatOpenAI, question: str) -> Dict[str, Any]:
 
 def generate_alternative_queries(llm: ChatOpenAI, question: str) -> List[str]:
     system_msg = (
-        "You are helping with information retrieval. Given a question, "
-        "generate 2 alternate phrasings that keep the same meaning but use "
-        "different words and structure. Return them as a JSON list of strings."
+        "Generate 2 alternate phrasings of the question with the same meaning. "
+        "Return ONLY a JSON list of strings."
     )
-
     resp = llm.invoke(
         [{"role": "system", "content": system_msg},
          {"role": "user", "content": f"Original question: {question}"}]
@@ -264,7 +255,7 @@ def retrieve_docs(
             key = (
                 d.metadata.get("title", ""),
                 d.metadata.get("url", ""),
-                hash((d.page_content or "")[:200]),
+                (d.page_content or "")[:200],
             )
             if key not in seen_ids:
                 seen_ids.add(key)
@@ -280,32 +271,29 @@ def retrieve_docs(
     return all_docs[:max_docs]
 
 # ============================================================
-# STEP 5 – ANSWERING
+# STEP 5 – ANSWERING (FIX: GROUNDED FALLBACK IF IDK)
 # ============================================================
 
 def build_context_for_llm(docs: List[Document]) -> str:
     chunks = []
     for i, d in enumerate(docs, 1):
         meta = d.metadata or {}
-        chunk = (
+        chunks.append(
             f"[DOC {i}]\n"
             f"Title: {meta.get('title', 'Unknown title')}\n"
             f"Category: {meta.get('category', 'unknown')}\n"
             f"URL: {meta.get('url', 'no-url')}\n\n"
             f"{d.page_content}\n"
         )
-        chunks.append(chunk)
     return "\n\n".join(chunks)
 
 def _is_idk(answer: str) -> bool:
     a = (answer or "").strip().lower()
     if not a:
         return True
-    idk_markers = [
+    markers = [
         "i don't know based on the available documents",
         "i dont know based on the available documents",
-        "i don't know based on the available document",
-        "i dont know based on the available document",
         "i don't know based on the context",
         "i dont know based on the context",
         "i don't know",
@@ -313,40 +301,68 @@ def _is_idk(answer: str) -> bool:
         "no relevant info",
         "not enough information",
     ]
-    return any(m in a for m in idk_markers)
+    return any(m in a for m in markers)
 
 def answer_specific(llm: ChatOpenAI, docs: List[Document], question: str) -> str:
     context = build_context_for_llm(docs)
+
+    # Pass 1 (strict)
     system_msg = (
         "You are an internal FAQ assistant for a construction company.\n"
-        "You answer questions using ONLY the provided context from the "
-        "PlaceMakers 'Under Construction' LEARN articles.\n\n"
-        "If the answer is not clearly contained in the context, say:\n"
+        "Answer using ONLY the provided context.\n\n"
+        "If the answer is not clearly contained in the context, say exactly:\n"
         "\"I don't know based on the available documents.\"\n"
-        "Do NOT invent or guess beyond the context.\n"
-        "Cite concepts in natural language, not by doc number."
+        "Do NOT invent details."
     )
     resp = llm.invoke(
         [{"role": "system", "content": system_msg},
          {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}]
     )
-    return (resp.content or "").strip()
+    answer = (resp.content or "").strip()
+
+    # ✅ FIX: If docs exist but model still says IDK, force grounded "best possible" answer
+    if _is_idk(answer) and docs:
+        fallback_system = (
+            "You are an internal FAQ assistant for a construction company.\n"
+            "You MUST use ONLY the provided context and MUST NOT invent.\n\n"
+            "Important: If the documents contain related guidance but not a full step-by-step procedure, "
+            "you should still answer with what IS available and clearly say what is missing.\n\n"
+            "Only reply with:\n"
+            "\"I don't know based on the available documents.\"\n"
+            "if the context contains NOTHING relevant."
+        )
+        fallback_user = (
+            f"Context:\n{context}\n\n"
+            f"Question: {question}\n\n"
+            "Write a helpful answer grounded strictly in the context.\n"
+            "- If 'how to install' steps are not explicitly given, provide the relevant considerations/checklist from the text.\n"
+            "- Clearly state limitations (e.g., 'these documents discuss considerations, not full installation steps')."
+        )
+        resp2 = llm.invoke(
+            [{"role": "system", "content": fallback_system},
+             {"role": "user", "content": fallback_user}]
+        )
+        answer2 = (resp2.content or "").strip()
+        if answer2 and not _is_idk(answer2):
+            return answer2
+
+    return answer
 
 def answer_broad(llm: ChatOpenAI, docs: List[Document], question: str) -> str:
     partials = []
     for d in docs:
         meta = d.metadata or {}
         system_msg = (
-            "You are summarizing one document for an internal FAQ assistant.\n"
-            "Use ONLY the given document to answer the question.\n"
-            "If the document doesn't help, answer: \"No relevant info in this document.\""
+            "Summarize ONE document for answering the question.\n"
+            "Use ONLY the given document.\n"
+            "If it doesn't help, say: \"No relevant info in this document.\""
         )
         user_msg = (
             f"Document title: {meta.get('title', 'Unknown title')}\n"
             f"Category: {meta.get('category', 'unknown')}\n\n"
             f"Document content:\n{d.page_content}\n\n"
             f"Question: {question}\n\n"
-            "Write a brief partial answer (3–6 sentences) based ONLY on this document."
+            "Write a brief partial answer (3–6 sentences) grounded ONLY in this document."
         )
         resp = llm.invoke(
             [{"role": "system", "content": system_msg},
@@ -356,20 +372,37 @@ def answer_broad(llm: ChatOpenAI, docs: List[Document], question: str) -> str:
 
     combined = "\n\n---\n\n".join(partials)
     system_msg = (
-        "You are combining partial answers from multiple documents into a single, "
-        "coherent answer for an internal FAQ assistant.\n"
-        "Merge them, remove duplicates, and create a clear, structured answer.\n"
-        "If many partial answers say there is no relevant info, you must answer:\n"
+        "Combine partial answers into one coherent answer.\n"
+        "Remove duplicates.\n"
+        "If there is effectively no relevant info, reply exactly:\n"
         "\"I don't know based on the available documents.\""
     )
     resp = llm.invoke(
         [{"role": "system", "content": system_msg},
          {"role": "user", "content": f"Question: {question}\n\nPartial answers:\n{combined}"}]
     )
-    return (resp.content or "").strip()
+    answer = (resp.content or "").strip()
+
+    # ✅ Same grounded fallback for broad mode
+    if _is_idk(answer) and docs:
+        context = build_context_for_llm(docs)
+        fallback_system = (
+            "You MUST use ONLY the provided context and MUST NOT invent.\n"
+            "If docs contain partial/related guidance, summarize it and state limitations.\n"
+            "Only reply with \"I don't know based on the available documents.\" if nothing relevant exists."
+        )
+        resp2 = llm.invoke(
+            [{"role": "system", "content": fallback_system},
+             {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}]
+        )
+        answer2 = (resp2.content or "").strip()
+        if answer2 and not _is_idk(answer2):
+            return answer2
+
+    return answer
 
 # ============================================================
-# UI HELPERS – ONLY LINKS, NO RAW CHUNKS
+# UI – LINKS LIST
 # ============================================================
 
 def list_sources_markdown(docs: List[Document]) -> str:
@@ -405,29 +438,36 @@ def main():
 
     st.sidebar.empty()
 
+    # ✅ Added: brief user guideline block
     with st.expander("📘 Guidelines: How to use this application", expanded=True):
         st.markdown(
             """
-**What this app is**
-- Helps you search and summarize answers from the internal **LEARN** corpus.
-- Answers are generated **only** from the indexed articles.
+**How to use**
+1. **Type your question** in the box (keep it short and specific).
+2. Click **Get Answer**.
+3. Read the **Answer** generated strictly from the LEARN corpus.
+4. If source links appear, open them to verify the original article.
+
+**Tips for better results**
+- Use **keywords**: e.g., *unheated slab, insulation, consent, LBP, H1, moisture, cladding, PPE*.
+- If the answer is weak, **rephrase** the question using simpler words.
 
 **Important**
-- If content is not present in documents, assistant responds:  
-  *“I don't know based on the available documents.”*
-- ✅ If the answer is *“I don't know…”*, this app will **NOT** show source links.
+- If content is not present in documents, the assistant responds:  
+  **“I don't know based on the available documents.”**
+- ✅ If the answer is **IDK**, the app will **NOT** show source links.
             """
         )
 
     ensure_openai_key()
 
     with st.spinner("Loading corpus and building/loading FAISS index..."):
-        vectordb, _index_info = get_vectordb_from_local_corpus()
+        vectordb, _ = get_vectordb_from_local_corpus()
 
     st.subheader("Ask a question")
     question = st.text_input(
         "Ask anything based on the LEARN content:",
-        placeholder="e.g., Why do ground clearances matter for cladding and flooring?",
+        placeholder="e.g., How to install an unheated slab?",
     )
 
     col1, col2 = st.columns([1, 5])
@@ -460,7 +500,7 @@ def main():
         st.markdown("### ✅ Answer")
         st.write(answer)
 
-        # ✅ FIX: If answer is "I don't know..." then do NOT show source links
+        # ✅ Requirement: if IDK, do not show links
         if not _is_idk(answer):
             st.markdown("### 🔗 Source Articles (Links Only)")
             st.caption("These LEARN articles were used to answer your question:")
@@ -468,3 +508,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
